@@ -1,0 +1,147 @@
+/*
+ * services/macAllocator.js — pull MACs from mac_pool for a batch.
+ *
+ * Two operations:
+ *   allocateForBatch({ batchId, deviceIds, connectionType, macsPerDevice })
+ *     Atomically claims (deviceIds.length * macsPerDevice) MACs from
+ *     mac_pool of the requested type, flipping status available → assigned
+ *     and stamping (iwon=batchId, deviceId).
+ *     Returns Map<deviceId, [macHex, ...]>.
+ *     All-or-nothing: any failure releases the MACs already claimed.
+ *
+ *   releaseForBatch(batchId)
+ *     Flips assigned → available for every MAC stamped with iwon=batchId.
+ *     Used when batch creation fails partway through, or when an admin
+ *     deletes a batch that hasn't been burned yet.
+ *
+ * Allocator NEVER touches MACs in status 'burned' — those are fleet truth
+ * and only the verification flow can move a MAC there.
+ */
+
+const MacPool = require('../models/macPool');
+
+// Format hex (12 char) → "80:77:86:50:00:01" for display / mac.txt
+function formatMac(hex12) {
+    if (!hex12 || hex12.length !== 12) return null;
+    return [0, 2, 4, 6, 8, 10].map(i => hex12.slice(i, i + 2)).join(':').toUpperCase();
+}
+
+async function pickOne(connectionType) {
+    // Atomic claim — race-safe across concurrent batches.
+    // Prefer rows already typed for this connection. Fall back to typeless
+    // (type=null) rows — they were imported without a type marker and are
+    // claimable for any type at allocation time. We stamp the requested
+    // type on them as part of the claim.
+    let claimed = await MacPool.findOneAndUpdate(
+        { status: 'available', type: connectionType },
+        { $set: { status: 'assigned', assignedAt: new Date() } },
+        { new: true }
+    );
+    if (!claimed) {
+        claimed = await MacPool.findOneAndUpdate(
+            { status: 'available', type: null },
+            { $set: { status: 'assigned', type: connectionType, assignedAt: new Date() } },
+            { new: true }
+        );
+    }
+    return claimed;
+}
+
+async function allocateForBatch({ batchId, deviceIds, connectionType, macsPerDevice = 1 }) {
+    if (!batchId || !Array.isArray(deviceIds) || !deviceIds.length) {
+        throw new Error('allocateForBatch: batchId and deviceIds[] required');
+    }
+    if (!['Eth', 'WIFI', '4G'].includes(connectionType)) {
+        throw new Error(`allocateForBatch: unsupported connectionType '${connectionType}'`);
+    }
+    const total = deviceIds.length * macsPerDevice;
+
+    // Cheap pre-flight so we 409 fast instead of claiming half the pool first.
+    // Counts both typed-for-this-connection rows AND typeless rows (which the
+    // allocator can claim for any type at pickOne time).
+    const avail = await MacPool.countDocuments({
+        status: 'available',
+        $or: [{ type: connectionType }, { type: null }],
+    });
+    if (avail < total) {
+        const err = new Error(
+            `Insufficient ${connectionType} MACs in pool: need ${total}, have ${avail}`
+        );
+        err.code = 'MAC_POOL_EXHAUSTED';
+        err.statusCode = 409;
+        throw err;
+    }
+
+    const assignment = new Map();   // deviceId → [hex, ...]
+    const claimedHexes = [];        // flat list for rollback
+
+    try {
+        for (const deviceId of deviceIds) {
+            const macs = [];
+            for (let i = 0; i < macsPerDevice; i++) {
+                const row = await pickOne(connectionType);
+                if (!row) {
+                    // Race: another batch drained the pool between countDocuments
+                    // and now. Roll back everything we've claimed in this call.
+                    const err = new Error(
+                        `Pool drained mid-allocation (claimed ${claimedHexes.length}/${total})`
+                    );
+                    err.code = 'MAC_POOL_RACE';
+                    err.statusCode = 409;
+                    throw err;
+                }
+                macs.push(row.mac);
+                claimedHexes.push(row.mac);
+            }
+            assignment.set(deviceId, macs);
+
+            // Now stamp deviceId on each claimed MAC for this device
+            await MacPool.updateMany(
+                { mac: { $in: macs } },
+                { $set: { deviceId, iwon: batchId } }
+            );
+        }
+        return assignment;
+    } catch (e) {
+        // Rollback — only the rows we just claimed in this call
+        if (claimedHexes.length) {
+            await MacPool.updateMany(
+                { mac: { $in: claimedHexes } },
+                {
+                    $set: { status: 'available' },
+                    $unset: { deviceId: '', iwon: '', assignedAt: '' },
+                }
+            );
+        }
+        throw e;
+    }
+}
+
+async function releaseForBatch(batchId) {
+    // Only releases 'assigned' rows — once a MAC is 'burned' it stays put.
+    const r = await MacPool.updateMany(
+        { iwon: batchId, status: 'assigned' },
+        {
+            $set: { status: 'available' },
+            $unset: { deviceId: '', iwon: '', assignedAt: '' },
+        }
+    );
+    return r.modifiedCount || 0;
+}
+
+async function markBurnedForDevice(deviceId, mac) {
+    // Called by the verification flow when station reports the MAC was
+    // actually written to the device. Idempotent — re-running on a row
+    // already 'burned' is a no-op.
+    return MacPool.updateOne(
+        { mac, deviceId, status: { $in: ['assigned', 'burned'] } },
+        { $set: { status: 'burned', burnedAt: new Date() } }
+    );
+}
+
+module.exports = {
+    allocateForBatch,
+    releaseForBatch,
+    markBurnedForDevice,
+    formatMac,
+};

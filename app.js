@@ -9,10 +9,11 @@ const cameraRoutes = require('./routes/cameraRoute');
 // const videoRoutes = require('./routes/videoRoutes');
 const adminRoutes = require('./routes/adminRoutes');
 const otaRutes = require('./routes/otaRoutes');
-// Provisioning + v2 station endpoints moved to MPS (Manufacturing Platform
-// Server) on 2026-05-02. Reachable at https://mps.devices.arcisai.io and
-// also via path-based routing on https://ems.devices.arcisai.io/backend/api/{provision,v2}/*
-// (nginx forwards both to MPS:5002). See /home/rahul/arcisai-mps/.
+// Provisioning + v2 station endpoints folded back in from MPS (Manufacturing
+// Platform Server) — these were split out on 2026-05-02 and merged back here
+// so EMS serves the full provisioning/cert/station surface again.
+const provisioningRoutes = require('./routes/provisioningRoutes');
+const v2Routes = require('./routes/v2Routes');
 const mqttService = require('./services/mqttService');
 //const supportRoutes = require('./routes/supportRoutes');
 //const batchRoutes = require('./routes/batchRoutes');
@@ -100,7 +101,9 @@ app.use('/api/camera', cameraRoutes);
 // app.use('/api/video', videoRoutes);
 app.use('/api/admin', adminRoutes);
 app.use('/api/ota', otaRutes);
-// app.use('/api/provision', ...) and app.use('/api/v2', ...) — moved to MPS.
+// Provisioning + v2 station endpoints — folded back in from MPS.
+app.use('/api/provision', provisioningRoutes);
+app.use('/api/v2', v2Routes);
 //app.use('/api/support', supportRoutes);
 //app.use('/api/production', batchRoutes);
 //app.use('/api/stqc', stqcUserRoutes);
